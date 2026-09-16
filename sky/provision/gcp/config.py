@@ -1,12 +1,14 @@
 """GCP configuration bootstrapping."""
 import copy
 import logging
+import re
 import time
 import typing
 from typing import Any, Dict, List, Set, Tuple
 
 from typing_extensions import TypedDict
 
+from sky import skypilot_config
 from sky.adaptors import gcp
 from sky.clouds.utils import gcp_utils
 from sky.provision import common
@@ -331,8 +333,32 @@ def _configure_iam_role(config: common.ProvisionConfig, crm, iam) -> dict:
     an IAM role that allows it to create further gce instances and store items
     in google cloud storage.
 
-    TODO: Allow the name/id of the service account to be configured
+    A configured existing service account bypasses IAM setup.
     """
+    custom_email = skypilot_config.get_effective_region_config(
+        cloud='gcp',
+        region=config.provider_config.get('region'),
+        keys=('service_account',),
+        default_value=None)
+    if custom_email is not None:
+        if (not isinstance(custom_email, str) or re.fullmatch(
+                r'[a-z][a-z0-9-]{4,29}@'
+                r'[a-z][a-z0-9-]{4,28}[a-z0-9]'
+                r'\.iam\.gserviceaccount\.com', custom_email) is None):
+            raise ValueError('Invalid gcp.service_account email: '
+                             f'{custom_email!r}')
+        # The caller manages this account and its permissions. Do not query
+        # or modify IAM, including service account creation or role bindings.
+        custom_account_dict = {
+            'email': custom_email,
+            'scopes': ['https://www.googleapis.com/auth/cloud-platform'],
+        }
+        if (instance_utils.get_node_type(
+                config.node_config) == instance_utils.GCPNodeType.TPU):
+            custom_account_dict['scope'] = custom_account_dict.pop('scopes')
+            return {'serviceAccount': custom_account_dict}
+        return {'serviceAccounts': [custom_account_dict]}
+
     project_id = config.provider_config['project_id']
     email = constants.SKYPILOT_SERVICE_ACCOUNT_EMAIL_TEMPLATE.format(
         account_id=constants.SKYPILOT_SERVICE_ACCOUNT_ID,

@@ -2046,6 +2046,9 @@ def get_config_schema():
             'required': [],
             'additionalProperties': False,
             'properties': {
+                'service_account': {
+                    'type': 'string',
+                },
                 'prioritize_reservations': {
                     'type': 'boolean',
                 },
