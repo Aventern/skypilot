@@ -25,6 +25,7 @@ from sky.utils import annotations
 from sky.utils import common_utils
 from sky.utils import registry
 from sky.utils import resources_utils
+from sky.utils import stage2_hardening
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
@@ -1165,6 +1166,8 @@ class GCP(clouds.Cloud):
         config_project_id = skypilot_config.get_workspace_cloud('gcp').get(
             'project_id', None)
         if config_project_id:
+            stage2_hardening.check_project_id(config_project_id)
+            stage2_hardening.check_gcloud_project()
             return config_project_id
         _, project_id = _get_default()
         if project_id is None:
@@ -1172,6 +1175,8 @@ class GCP(clouds.Cloud):
                 'Failed to get GCP project id. Please make sure you have '
                 'run the following: gcloud init; '
                 'gcloud auth application-default login')
+        stage2_hardening.check_project_id(project_id)
+        stage2_hardening.check_gcloud_project()
         return project_id
 
     @staticmethod

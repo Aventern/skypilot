@@ -3109,6 +3109,17 @@ def get_config_schema():
             'serve': _get_controller_schema(),
             'allowed_clouds': allowed_clouds,
             'admin_policy': admin_policy_schema,
+            'stage2_hardening': {
+                'type': 'object',
+                'additionalProperties': False,
+                'required': ['project_id'],
+                'properties': {
+                    'project_id': {
+                        'type': 'string',
+                        'pattern': r'^[a-z][a-z0-9-]{4,28}[a-z0-9]$',
+                    },
+                },
+            },
             'docker': docker_configs,
             'nvidia_gpus': gpu_configs,
             'api_server': api_server,

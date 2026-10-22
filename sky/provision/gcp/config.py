@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Set, Tuple
 
 from typing_extensions import TypedDict
 
+from sky import clouds
 from sky import skypilot_config
 from sky.adaptors import gcp
 from sky.clouds.utils import gcp_utils
@@ -16,6 +17,7 @@ from sky.provision import constants as provision_constants
 from sky.provision.gcp import constants
 from sky.provision.gcp import instance_utils
 from sky.utils import resources_utils
+from sky.utils import stage2_hardening
 
 logger = logging.getLogger(__name__)
 
@@ -179,6 +181,10 @@ def construct_clients_from_provider_config(provider_config):
 def bootstrap_instances(
         region: str, cluster_name: str,
         config: common.ProvisionConfig) -> common.ProvisionConfig:
+    if stage2_hardening.enabled():
+        stage2_hardening.check_project_id(clouds.GCP.get_project_id())
+        stage2_hardening.check_project_id(
+            config.provider_config.get('project_id'))
     # Check if we have any TPUs defined, and if so,
     # insert that information into the provider config
     if instance_utils.get_node_type(

@@ -49,6 +49,7 @@ from sky.provision.mithril import utils as mithril_utils
 from sky.provision.primeintellect import utils as primeintellect_utils
 from sky.utils import auth_utils
 from sky.utils import common_utils
+from sky.utils import stage2_hardening
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.utils import yaml_utils
@@ -100,6 +101,9 @@ def parse_gcp_project_oslogin(project):
 # Retry for the GCP as sometimes there will be connection reset by peer error.
 @common_utils.retry
 def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
+    if stage2_hardening.enabled():
+        stage2_hardening.check_project_id(clouds.GCP.get_project_id())
+        stage2_hardening.check_project_id(config['provider']['project_id'])
     _, public_key_path = auth_utils.get_or_generate_keys()
     config = copy.deepcopy(config)
 
@@ -151,6 +155,10 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
 
     project_oslogin = parse_gcp_project_oslogin(project)
     if project_oslogin.lower() == 'true':
+        if stage2_hardening.enabled():
+            raise exceptions.InvalidCloudConfigs(
+                'Stage 2 forbids OS Login authentication and firewall creation.'
+            )
         logger.info(
             f'OS Login is enabled for GCP project {project_id}. Running '
             'additional authentication steps.')

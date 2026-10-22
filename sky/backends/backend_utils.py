@@ -65,6 +65,7 @@ from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import rich_utils
 from sky.utils import schemas
+from sky.utils import stage2_hardening
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import tempstore
@@ -915,6 +916,10 @@ def write_cluster_config(
         for k, v in logging_agent.get_credential_file_mounts().items():
             assert k not in credentials, f'{k} already in credentials'
             credentials[k] = v
+
+    if stage2_hardening.enabled() and credentials:
+        raise exceptions.InvalidCloudConfigs(
+            'Stage 2 forbids all cloud and logging credential mounts.')
 
     private_key_path, _ = auth_utils.get_or_generate_keys()
     auth_config = {'ssh_private_key': private_key_path}

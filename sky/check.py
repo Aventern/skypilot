@@ -24,6 +24,7 @@ from sky.skylet import constants
 from sky.utils import common_utils
 from sky.utils import registry
 from sky.utils import rich_utils
+from sky.utils import stage2_hardening
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 from sky.workspaces import constants as workspace_constants
@@ -560,6 +561,8 @@ def get_cloud_credential_file_mounts(
     Returns a dictionary that will be added to a task's file mounts
     and a list of patterns that will be excluded (used as rsync_exclude).
     """
+    if stage2_hardening.enabled():
+        return {}
     # Uploading credentials for all clouds instead of only sky check
     # enabled clouds because users may have partial credentials for some
     # clouds to access their specific resources (e.g. cloud storage) but
