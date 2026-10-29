@@ -5,21 +5,40 @@ from typing import Optional
 
 from sky import exceptions
 from sky import skypilot_config
+from sky.utils import stage2_ownership
 
 # The controller checks this marker before accepting the installed fork.
-VERSION = 1
+VERSION = 2
 
 
-def project_id() -> Optional[str]:
+def settings():
     config = skypilot_config.get_nested(('stage2_hardening',), None)
     if config is None:
         return None
-    if (not isinstance(config, dict) or set(config) != {'project_id'} or
-            not isinstance(config['project_id'], str) or re.fullmatch(
-                r'[a-z][a-z0-9-]{4,28}[a-z0-9]', config['project_id']) is None):
-        raise exceptions.InvalidCloudConfigs(
-            'Stage 2 hardening requires an explicit GCP project ID.')
-    return config['project_id']
+    keys = {
+        'project_id', 'allowed_project_ids', 'control_bucket',
+        'evidence_bucket', 'pool', 'guest_service_account'
+    }
+    try:
+        if not isinstance(config, dict) or set(config) != keys:
+            raise ValueError('Stage 2 hardening configuration is incomplete')
+        stage2_ownership.require_allowed_project(config['project_id'],
+                                                 config['allowed_project_ids'])
+        if (re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,17}', config['pool']) is None or
+                any(
+                    re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', config[k])
+                    is None for k in ('control_bucket', 'evidence_bucket')) or
+                not config['guest_service_account'].endswith(
+                    '@' + config['project_id'] + '.iam.gserviceaccount.com')):
+            raise ValueError('Stage 2 hardening identity is malformed')
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise exceptions.InvalidCloudConfigs(str(exc)) from exc
+    return config
+
+
+def project_id() -> Optional[str]:
+    config = settings()
+    return None if config is None else config['project_id']
 
 
 def enabled() -> bool:

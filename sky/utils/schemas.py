@@ -3112,11 +3112,33 @@ def get_config_schema():
             'stage2_hardening': {
                 'type': 'object',
                 'additionalProperties': False,
-                'required': ['project_id'],
+                'required': [
+                    'project_id', 'allowed_project_ids', 'control_bucket',
+                    'evidence_bucket', 'pool', 'guest_service_account'
+                ],
                 'properties': {
                     'project_id': {
-                        'type': 'string',
-                        'pattern': r'^[a-z][a-z0-9-]{4,28}[a-z0-9]$',
+                        'type': 'string'
+                    },
+                    'allowed_project_ids': {
+                        'type': 'array',
+                        'minItems': 1,
+                        'uniqueItems': True,
+                        'items': {
+                            'type': 'string'
+                        }
+                    },
+                    'control_bucket': {
+                        'type': 'string'
+                    },
+                    'evidence_bucket': {
+                        'type': 'string'
+                    },
+                    'pool': {
+                        'type': 'string'
+                    },
+                    'guest_service_account': {
+                        'type': 'string'
                     },
                 },
             },
