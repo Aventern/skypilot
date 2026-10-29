@@ -547,3 +547,48 @@ def test_recovery_after_partial_cleanup_allocates_fresh_name(environment):
     assert len(
         journal.read_records(storage, CONFIG['control_bucket'],
                              CONFIG['pool'])) == 2
+
+
+@pytest.mark.parametrize('kind', ['instances', 'disks'])
+def test_pending_insert_is_never_retired_by_two_invisible_reads(
+        environment, kind):
+    storage, compute, j, binding, _ = environment
+    name = create(environment)
+    hidden = compute.resources[kind].pop(name)
+    operation = next(op for op in compute.operations.values()
+                     if op['targetLink'] == hidden['selfLink'])
+    operation['status'] = 'PENDING'
+    with pytest.raises(RuntimeError, match='insert operation'):
+        j.cleanup_disks(compute, binding['cluster'], PROJECT, ZONE)
+    active = journal.read_records(storage, CONFIG['control_bucket'],
+                                  CONFIG['pool'])
+    assert any(r['request']['kind'] == kind and r['request']['name'] == name
+               for r in active)
+    # The create eventually finishes after cancellation. Its original proof is
+    # still present, so repeated cleanup must reclaim exactly this incarnation.
+    operation['status'] = 'DONE'
+    compute.resources[kind][name] = hidden
+    for attempt in range(3):
+        try:
+            journal.cleanup_job(job_id=42)
+            break
+        except RuntimeError:
+            if attempt == 2:
+                raise
+    assert not journal.read_records(storage, CONFIG['control_bucket'],
+                                    CONFIG['pool'])
+    assert all(not group for group in compute.resources.values())
+
+
+def test_rpc_timeout_is_clamped_to_remaining_scope(environment, monkeypatch):
+    request = SimpleNamespace(http=SimpleNamespace(timeout=None))
+    request.execute = lambda **_: request.http.timeout
+    monkeypatch.setattr(journal.time, 'monotonic', lambda: 129.0)
+    token = journal._SCOPE.set([0, 100.0])
+    try:
+        assert journal.rpc(request) == 1.0
+        monkeypatch.setattr(journal.time, 'monotonic', lambda: 130.0)
+        with pytest.raises(RuntimeError):
+            journal.rpc(request)
+    finally:
+        journal._SCOPE.reset(token)

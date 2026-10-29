@@ -34,6 +34,15 @@ def _charge():
         scope[0] += 1
 
 
+def _timeout():
+    scope = _SCOPE.get()
+    remaining = 10 if scope is None else min(10, 30 -
+                                             (time.monotonic() - scope[1]))
+    if remaining <= 0:
+        raise RuntimeError('Stage 2 ownership RPC deadline exhausted')
+    return remaining
+
+
 def bounded(function):
 
     @functools.wraps(function)
@@ -54,7 +63,7 @@ def rpc(request):
         _charge()
     # Discovery HttpRequest uses this httplib2 timeout for the actual request.
     if hasattr(request, 'http') and hasattr(request.http, 'timeout'):
-        request.http.timeout = 10
+        request.http.timeout = _timeout()
     return request.execute(num_retries=0)
 
 
@@ -72,7 +81,7 @@ def _code(error):
 def _read(blob):
     _charge()
     try:
-        body = blob.download_as_bytes(timeout=10, retry=None)
+        body = blob.download_as_bytes(timeout=_timeout(), retry=None)
     except Exception as exc:
         if _code(exc) == 404:
             return None
@@ -90,7 +99,7 @@ def _put(blob, value, generation=0):
         blob.upload_from_string(body,
                                 content_type='application/json',
                                 if_generation_match=generation,
-                                timeout=10,
+                                timeout=_timeout(),
                                 retry=None)
     except Exception as exc:
         if _code(exc) != 412:
@@ -136,6 +145,7 @@ class Journal:
         self.bucket = self.storage.bucket(self.config['control_bucket'])
         self.prefix = f"stage2/{self.config['pool']}/ownership/"
         self._repaired = set()
+        self._completed = set()
 
     def blob(self, suffix):
         if any(part in ('', '.', '..') for part in suffix.split('/')):
@@ -159,7 +169,7 @@ class Journal:
             uri.path.removeprefix('/'), generation=receipt['generation'])
         _charge()
         body = blob.download_as_bytes(if_generation_match=receipt['generation'],
-                                      timeout=10,
+                                      timeout=_timeout(),
                                       retry=None)
         if hashlib.sha256(body).hexdigest() != receipt['sha256']:
             raise ValueError('intent digest differs')
@@ -298,6 +308,38 @@ class Journal:
             return value
         return self.observe_operation(request, operation)
 
+    def confirm_insert_done(self, compute, receipt):
+        request = receipt['request']
+        expected = receipt['operation']
+        key = (request['kind'], request['zone'], request['name'])
+        if key in self._completed:
+            return
+        blob = self.blob(
+            f"completed/{request['kind']}/{request['zone']}/{request['name']}.json"
+        )
+        completed = _read(blob)
+        missing = completed is None
+        if missing:
+            completed = rpc(compute.zoneOperations().get(
+                project=request['project_id'],
+                zone=request['zone'],
+                operation=expected['name']))
+        if (any(
+                completed.get(k) != expected[k]
+                for k in ('name', 'clientOperationId', 'targetId', 'targetLink',
+                          'operationType')) or
+                completed.get('status') != 'DONE' or completed.get('error')):
+            raise RuntimeError(
+                'insert operation is not confirmed DONE and successful')
+        # Store only immutable final identity/status, not progress or timestamps.
+        proof = {
+            k: completed[k] for k in ('name', 'clientOperationId', 'targetId',
+                                      'targetLink', 'operationType', 'status')
+        }
+        if missing:
+            _put(blob, proof)
+        self._completed.add(key)
+
     def require_owned(self, compute, kind, project, zone, name):
         stage2_hardening.check_project_id(project)
         collection = getattr(compute, kind)()
@@ -321,6 +363,9 @@ class Journal:
                 resource, records, project_id=project,
                 resources=resources) != ownership.OWNED:
             raise ValueError('Stage 2 mutation target is not owned')
+        self.confirm_insert_done(compute, receipt)
+        if kind == 'instances':
+            self.confirm_insert_done(compute, disk_receipt)
         return resource, receipt
 
     def reclaim_started(self, kind, zone, name):
@@ -617,6 +662,7 @@ class Journal:
                 if receipt is not None:
                     if self.close_failed_insert(compute, receipt):
                         continue
+                    self.confirm_insert_done(compute, receipt)
                     absent = 0
                     for _ in range(2):
                         try:
@@ -642,6 +688,7 @@ class Journal:
                 receipt = self.resolve_ambiguous(compute, request)
             if self.close_failed_insert(compute, receipt):
                 continue
+            self.confirm_insert_done(compute, receipt)
             disk_id = receipt['operation']['targetId']
             absent = 0
             for _ in range(3):
@@ -680,7 +727,7 @@ class _BoundedRequest:
         _charge()
         http = getattr(self.request, 'http', None)
         if http is not None:
-            http.timeout = 10
+            http.timeout = _timeout()
         return self.request.execute(num_retries=0)
 
 
