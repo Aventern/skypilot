@@ -65,6 +65,8 @@ from sky.utils import log_utils
 from sky.utils import message_utils
 from sky.utils import resources_utils
 from sky.utils import rich_utils
+from sky.utils import stage2_hardening
+from sky.utils import stage2_journal
 from sky.utils import subprocess_utils
 from sky.utils import ux_utils
 
@@ -194,6 +196,9 @@ def terminate_cluster(
     graceful_timeout: Optional[int] = None,
 ) -> None:
     """Terminate the cluster."""
+    if stage2_hardening.enabled():
+        stage2_journal.cleanup_job(cluster=cluster_name)
+
     from sky import core  # pylint: disable=import-outside-toplevel
 
     # Pin the active workspace to the cluster's recorded workspace before
@@ -1778,6 +1783,8 @@ def cancel_jobs_by_id(job_ids: Optional[List[int]],
             continue
 
         if job_status.is_terminal():
+            if stage2_hardening.enabled():
+                stage2_journal.cleanup_job(job_id=job_id)
             logger.info(f'Job {job_id} is already in terminal state '
                         f'{job_status.value}. Skipped.')
             continue

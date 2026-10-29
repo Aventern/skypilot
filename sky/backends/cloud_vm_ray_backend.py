@@ -80,6 +80,7 @@ from sky.utils import message_utils
 from sky.utils import registry
 from sky.utils import resources_utils
 from sky.utils import rich_utils
+from sky.utils import stage2_hardening
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import timeline
@@ -1142,6 +1143,16 @@ class RetryingVmProvisioner(object):
             else:
                 template = _get_cluster_config_template(to_provision.cloud)
                 extra_vars = None
+
+            if stage2_hardening.enabled():
+                binding = (self._extra_launch_context or
+                           {}).get('stage2_binding')
+                if not self._is_launched_by_jobs_controller or binding is None:
+                    raise ValueError(
+                        'Stage 2 requires the managed job ownership binding')
+                extra_vars = dict(extra_vars or {},
+                                  stage2_binding=binding,
+                                  stage2_instance_oslogin=True)
 
             for failover_overrides in to_provision.cloud.yield_cloud_specific_failover_overrides(
                     region=to_provision.region):

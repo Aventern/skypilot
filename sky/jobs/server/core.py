@@ -53,6 +53,8 @@ from sky.utils import controller_utils
 from sky.utils import dag_utils
 from sky.utils import infra_utils
 from sky.utils import rich_utils
+from sky.utils import stage2_hardening
+from sky.utils import stage2_journal
 from sky.utils import status_lib
 from sky.utils import subprocess_utils
 from sky.utils import timeline
@@ -500,6 +502,14 @@ def _maybe_submit_job_locally(
                 parent_task_id=parent_task_id,
                 root_job_id=root_job_id,
                 dynamic_task_index=dynamic_task_index))
+        if stage2_hardening.enabled():
+            if len(dag.tasks) != 1 or num_jobs != 1 or pool is not None:
+                raise ValueError('Stage 2 requires a single managed job')
+            task = dag.tasks[0]
+            stage2_journal.Journal().bind_job(
+                task, consolidation_mode_job_id,
+                managed_job_utils.generate_managed_job_cluster_name(
+                    task.name, consolidation_mode_job_id))
         for task_id, task in enumerate(dag.tasks):
             resources_str = backend_utils.get_task_resources_str(
                 task, is_managed_job=True)

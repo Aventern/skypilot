@@ -1332,6 +1332,13 @@ def write_cluster_config(
     common_utils.fill_template(cluster_config_template,
                                variables,
                                output_path=tmp_yaml_path)
+    if stage2_hardening.enabled():
+        binding = (extra_template_variables or {}).get('stage2_binding')
+        if binding is None:
+            raise ValueError('Stage 2 provider ownership binding is missing')
+        generated = yaml_utils.read_yaml(tmp_yaml_path)
+        generated['provider']['stage2_ownership'] = binding
+        yaml_utils.dump_yaml(tmp_yaml_path, generated)
     config_dict['cluster_name'] = cluster_name
     config_dict['ray'] = yaml_path
 

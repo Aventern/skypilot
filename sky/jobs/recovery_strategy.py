@@ -40,6 +40,8 @@ from sky.utils import dag_utils
 from sky.utils import env_options
 from sky.utils import instance_links as instance_links_utils
 from sky.utils import registry
+from sky.utils import stage2_hardening
+from sky.utils import stage2_journal
 from sky.utils import status_lib
 from sky.utils import ux_utils
 
@@ -966,6 +968,17 @@ class StrategyExecutor:
                             try:
                                 if reattach_request_id is None:
                                     extra_ctx = self.extra_launch_context()
+                                    if stage2_hardening.enabled():
+                                        if len(self.dag.tasks) != 1:
+                                            raise ValueError(
+                                                'Stage 2 requires one managed task'
+                                            )
+                                        extra_ctx[
+                                            'stage2_binding'] = stage2_journal.Journal(
+                                            ).bind_job(self.dag.tasks[0],
+                                                       self.job_id,
+                                                       self.cluster_name)
+
                                     request_id = await asyncio.to_thread(
                                         sdk.launch,
                                         self.dag,
