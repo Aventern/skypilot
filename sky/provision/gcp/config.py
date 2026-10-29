@@ -185,6 +185,19 @@ def bootstrap_instances(
         stage2_hardening.check_project_id(clouds.GCP.get_project_id())
         stage2_hardening.check_project_id(
             config.provider_config.get('project_id'))
+        if (instance_utils.get_node_type(config.node_config) !=
+                instance_utils.GCPNodeType.COMPUTE or config.count != 1 or
+                not config.provider_config.get('vpc_name') or
+                config.provider_config.get('enable_gpu_direct') or
+                config.provider_config.get('network_tier') == 'best' or
+                config.provider_config.get('tpu_node') or
+                not config.provider_config.get('stage2_ownership') or
+                skypilot_config.get_nested(('gcp', 'service_account'), None) !=
+                stage2_hardening.settings()['guest_service_account'] or
+                config.node_config.get('resourcePolicies') or
+                config.node_config.get('reservationAffinity')):
+            raise ValueError('unsupported Stage 2 provisioning configuration')
+
     # Check if we have any TPUs defined, and if so,
     # insert that information into the provider config
     if instance_utils.get_node_type(
@@ -222,6 +235,8 @@ def _configure_project(provider_config, crm):
         ' config. Notice that the project id must be globally unique.')
     project = _get_project(project_id, crm)
 
+    if project is None and stage2_hardening.enabled():
+        raise ValueError("Stage 2 cannot create a project")
     if project is None:
         #  Project not found, try creating it
         _create_project(project_id, crm)
@@ -571,6 +586,8 @@ def _check_firewall_rules(cluster_name: str, vpc_name: str, project_id: str,
 
 
 def _delete_rules(project_id: str, compute, rules, vpc_name: str):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     for rule_ori in rules:
         # Query firewall rule by its name (unique in a project).
         rule_name = rule_ori['name'].format(VPC_NAME=vpc_name)
@@ -587,6 +604,8 @@ def _create_rules(project_id: str,
                   rules,
                   vpc_name,
                   recreate: bool = True):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     opertaions = []
     for rule in rules:
         # Query firewall rule by its name (unique in a project).
@@ -1026,6 +1045,8 @@ def _enable_external_ips(config: common.ProvisionConfig) -> bool:
 
 
 def _delete_firewall_rule(project_id: str, compute, name):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     operation = (compute.firewalls().delete(project=project_id,
                                             firewall=name).execute())
     response = wait_for_compute_global_operation(project_id, operation, compute)
@@ -1042,6 +1063,8 @@ def _list_firewall_rules(project_id, compute, filter=None):
 
 
 def _create_vpcnet(project_id: str, compute, body):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     operation = (compute.networks().insert(project=project_id,
                                            body=body).execute())
     response = wait_for_compute_global_operation(project_id, operation, compute)
@@ -1059,6 +1082,8 @@ def _list_vpcnets(project_id: str, compute, filter=None):  # pylint: disable=red
 
 
 def _delete_vpcnet(project_id: str, compute, vpcnet_name: str):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     operation = compute.networks().delete(
         project=project_id,
         network=vpcnet_name,
@@ -1106,6 +1131,8 @@ def _get_project(project_id: str, crm):
 
 
 def _create_project(project_id: str, crm):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     operation = (crm.projects().create(body={
         'projectId': project_id,
         'name': project_id
@@ -1135,6 +1162,8 @@ def _get_service_account(account: str, project_id: str, iam):
 
 def _create_service_account(account_id: str, account_config, project_id: str,
                             iam):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     service_account = (iam.projects().serviceAccounts().create(
         name='projects/{project_id}'.format(project_id=project_id),
         body={
@@ -1148,6 +1177,8 @@ def _create_service_account(account_id: str, account_config, project_id: str,
 
 def _add_iam_policy_binding(service_account, policy, crm, iam):
     """Add new IAM roles for the service account."""
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     del iam
     project_id = service_account['projectId']
 
@@ -1163,6 +1194,8 @@ def _add_iam_policy_binding(service_account, policy, crm, iam):
 
 def _create_subnet(project_id: str, region: str, compute, vpc_name: str,
                    subnet_name: str, ip_cidr_range: str):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     body = {
         'name': subnet_name,
         'ipCidrRange': ip_cidr_range,
@@ -1178,6 +1211,8 @@ def _create_subnet(project_id: str, region: str, compute, vpc_name: str,
 
 
 def _delete_subnet(project_id: str, region: str, compute, subnet_name: str):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     operation = compute.subnetworks().delete(
         project=project_id,
         region=region,
@@ -1189,6 +1224,8 @@ def _delete_subnet(project_id: str, region: str, compute, subnet_name: str):
 
 def _create_placement_policy(project_id: str, region: str, compute,
                              placement_policy: dict):
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     operation = compute.resourcePolicies().insert(
         project=project_id, region=region, body=placement_policy).execute()
     response = wait_for_compute_region_operation(project_id, region, operation,

@@ -15,6 +15,8 @@ from sky.provision.gcp import constants
 from sky.provision.gcp import instance_utils
 from sky.utils import common_utils
 from sky.utils import resources_utils
+from sky.utils import stage2_hardening
+from sky.utils import stage2_journal
 from sky.utils import status_lib
 
 logger = sky_logging.init_logger(__name__)
@@ -149,6 +151,14 @@ def _run_instances(region: str, cluster_name_on_cloud: str,
     """See sky/provision/__init__.py"""
     # NOTE: although google cloud instances have IDs, but they are
     #  not used for indexing. Instead, we use the instance name.
+    if stage2_hardening.enabled():
+        if (instance_utils.get_node_type(
+                config.node_config) != instance_utils.GCPNodeType.COMPUTE or
+                config.provider_config.get('tpu_node') or
+                config.provider_config.get('use_managed_instance_group')):
+            raise ValueError('unsupported Stage 2 provisioning type')
+        config.node_config['_stage2_ownership'] = config.provider_config.get(
+            'stage2_ownership')
     labels = config.tags  # gcp uses 'labels' instead of aws 'tags'
     labels = dict(sorted(copy.deepcopy(labels).items()))
     resumed_instance_ids: List[str] = []
@@ -455,11 +465,19 @@ def get_cluster_info(
     )
 
 
+@stage2_journal.bounded
 def stop_instances(
     cluster_name_on_cloud: str,
     provider_config: Optional[Dict[str, Any]] = None,
     worker_only: bool = False,
 ) -> None:
+    if stage2_hardening.enabled():
+        if provider_config is None or any(
+                provider_config.get(key)
+                for key in ('tpu_node', '_has_tpus',
+                            'use_managed_instance_group', 'enable_gpu_direct')):
+            raise ValueError('unsupported Stage 2 cleanup type')
+        stage2_hardening.check_project_id(provider_config['project_id'])
     assert provider_config is not None, cluster_name_on_cloud
     zone = provider_config['availability_zone']
     project_id = provider_config['project_id']
@@ -519,12 +537,20 @@ def stop_instances(
                            'STOPPED status.')
 
 
+@stage2_journal.bounded
 def terminate_instances(
     cluster_name_on_cloud: str,
     provider_config: Optional[Dict[str, Any]] = None,
     worker_only: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
+    if stage2_hardening.enabled():
+        if provider_config is None or any(
+                provider_config.get(key)
+                for key in ('tpu_node', '_has_tpus',
+                            'use_managed_instance_group', 'enable_gpu_direct')):
+            raise ValueError('unsupported Stage 2 cleanup type')
+        stage2_hardening.check_project_id(provider_config['project_id'])
     assert provider_config is not None, cluster_name_on_cloud
     zone = provider_config['availability_zone']
     project_id = provider_config['project_id']
@@ -575,6 +601,10 @@ def terminate_instances(
     _wait_for_operations(operations, project_id, zone)
     if errs:
         raise RuntimeError(f'Failed to terminate instances: {errs}')
+    if stage2_hardening.enabled():
+        stage2_journal.Journal().cleanup_disks(
+            instance_utils.GCPComputeInstance.load_resource(),
+            cluster_name_on_cloud, project_id, zone)
     # We don't wait for the instances to be terminated, as it can take a long
     # time (same as what we did in ray's node_provider).
 
@@ -585,6 +615,11 @@ def cleanup_custom_multi_network(
     failover: bool = False,
 ) -> None:
     """See sky/provision/__init__.py"""
+    if stage2_hardening.enabled():
+        if provider_config and (provider_config.get('enable_gpu_direct') or
+                                provider_config.get('network_tier') == 'best'):
+            raise ValueError('Stage 2 dynamic networks are forbidden')
+        return
     assert provider_config is not None, cluster_name_on_cloud
     project_id = provider_config['project_id']
     region = provider_config['region']
@@ -604,6 +639,8 @@ def open_ports(
     provider_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """See sky/provision/__init__.py"""
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     assert provider_config is not None, cluster_name_on_cloud
     zone = provider_config['availability_zone']
     project_id = provider_config['project_id']
@@ -662,6 +699,10 @@ def cleanup_ports(
     provider_config: Optional[Dict[str, Any]] = None,
 ) -> None:
     """See sky/provision/__init__.py"""
+    if stage2_hardening.enabled():
+        if ports:
+            raise ValueError('Stage 2 dynamic ports are forbidden')
+        return
     del ports  # Unused.
     assert provider_config is not None, cluster_name_on_cloud
     project_id = provider_config['project_id']

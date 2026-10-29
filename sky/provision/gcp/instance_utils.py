@@ -17,6 +17,9 @@ from sky.provision import constants as provision_constants
 from sky.provision.gcp import constants
 from sky.provision.gcp import mig_utils
 from sky.utils import common_utils
+from sky.utils import stage2_hardening
+from sky.utils import stage2_journal
+from sky.utils import stage2_ownership
 from sky.utils import ux_utils
 
 # Tag for the name of the node
@@ -363,18 +366,21 @@ class GCPComputeInstance(GCPInstance):
 
     @classmethod
     def load_resource(cls):
-        return gcp.build('compute',
-                         'v1',
-                         credentials=None,
-                         cache_discovery=False)
+        return stage2_journal.guard_compute(
+            gcp.build('compute', 'v1', credentials=None, cache_discovery=False))
 
     @classmethod
+    @stage2_journal.bounded
     def stop(
         cls,
         project_id: str,
         zone: str,
         instance: str,
     ) -> dict:
+        if stage2_hardening.enabled():
+            resource, _ = stage2_journal.Journal().require_owned(
+                cls.load_resource(), 'instances', project_id, zone, instance)
+            instance = str(resource['id'])
         operation = cls.load_resource().instances().stop(
             project=project_id,
             zone=zone,
@@ -388,12 +394,19 @@ class GCPComputeInstance(GCPInstance):
         return operation
 
     @classmethod
+    @stage2_journal.bounded
     def terminate(
         cls,
         project_id: str,
         zone: str,
         instance: str,
     ) -> dict:
+        if stage2_hardening.enabled():
+            resource, _ = stage2_journal.Journal().require_owned(
+                cls.load_resource(), 'instances', project_id, zone, instance)
+            instance = str(resource['id'])
+            stage2_journal.Journal().reclaim_started('instances', zone,
+                                                     resource['name'])
         operation = cls.load_resource().instances().delete(
             project=project_id,
             zone=zone,
@@ -441,7 +454,24 @@ class GCPComputeInstance(GCPInstance):
             filter=filter_expr,
             zone=zone,
         ).execute(num_retries=GCP_MAX_RETRIES))
+        if stage2_hardening.enabled() and response.get('nextPageToken'):
+            raise ValueError('Stage 2 instance filter is incomplete')
         instances = response.get('items', [])
+        if stage2_hardening.enabled():
+            journal = stage2_journal.Journal()
+            selected = []
+            for instance in instances:
+                receipt = journal.recover(cls.load_resource(), 'instances',
+                                          zone, instance['name'])
+                if receipt is not None:
+                    try:
+                        journal.require_owned(cls.load_resource(), 'instances',
+                                              project_id, zone,
+                                              instance['name'])
+                    except ValueError:
+                        continue
+                    selected.append(instance)
+            instances = selected
         instances = {i['name']: i for i in instances}
         if included_instances:
             instances = {
@@ -564,6 +594,8 @@ class GCPComputeInstance(GCPInstance):
         instance: str,
         tag: str,
     ) -> None:
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         try:
             # If we have multiple instances, they are in the same cluster,
             # i.e. the same VPC. So we can just pick one.
@@ -596,6 +628,8 @@ class GCPComputeInstance(GCPInstance):
         project_id: str,
         firewall_rule_name: str,
     ) -> None:
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         rule = cls.load_resource().firewalls().list(
             project=project_id, filter=f'name={firewall_rule_name}').execute()
         # For the return value format, please refer to
@@ -618,6 +652,8 @@ class GCPComputeInstance(GCPInstance):
         cluster_name_on_cloud: str,
         ports: List[str],
     ) -> dict:
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         try:
             body = cls.load_resource().firewalls().get(
                 project=project_id, firewall=firewall_rule_name).execute()
@@ -661,8 +697,19 @@ class GCPComputeInstance(GCPInstance):
     #   "Labels fingerprint either invalid or resource labels have changed"
     # We should retry until the labels are set successfully.
     @_retry_on_gcp_http_exception('Labels fingerprint either invalid')
+    @stage2_journal.bounded
     def set_labels(cls, project_id: str, availability_zone: str, node_id: str,
                    labels: dict) -> None:
+        if stage2_hardening.enabled():
+            checked, _ = stage2_journal.Journal().require_owned(
+                cls.load_resource(), 'instances', project_id, availability_zone,
+                node_id)
+            node_id = str(checked['id'])
+            protected = stage2_ownership.LABEL_KEYS + ('ray-cluster-name',
+                                                       'skypilot-cluster-name')
+            if any(key in labels and labels[key] != checked['labels'].get(key)
+                   for key in protected):
+                raise ValueError('Stage 2 ownership labels cannot change')
         node = cls.load_resource().instances().get(
             project=project_id,
             instance=node_id,
@@ -693,6 +740,36 @@ class GCPComputeInstance(GCPInstance):
         total_count: int,
         include_head_node: bool,
     ) -> Tuple[Optional[List], List[str]]:
+        if stage2_hardening.enabled():
+            if count != 1 or total_count != 1 or not include_head_node:
+                raise ValueError('Stage 2 requires one head VM')
+            config = copy.deepcopy(node_config)
+            binding = config.pop('_stage2_ownership', None)
+            if not isinstance(binding, dict):
+                raise ValueError('Stage 2 creation binding is missing')
+            config.pop('networkConfig', None)
+            if '/machineTypes/' not in config['machineType']:
+                config[
+                    'machineType'] = f"zones/{zone}/machineTypes/{config['machineType']}"
+            config['labels'] = dict(
+                config.get('labels', {}), **labels, **{
+                    provision_constants.TAG_RAY_CLUSTER_NAME: cluster_name,
+                    provision_constants.TAG_SKYPILOT_CLUSTER_NAME: cluster_name,
+                    provision_constants.TAG_RAY_NODE_KIND: 'head'
+                })
+            if (len(config.get('disks', [])) != 1 or
+                    config['disks'][0].get('boot') is not True or
+                    'initializeParams' not in config['disks'][0] or
+                    config.get('sourceMachineImage') or
+                    config.get('sourceInstanceTemplate') or
+                    config.get('reservationAffinity') or
+                    config.get('resourcePolicies')):
+                raise ValueError(
+                    'unsupported Stage 2 disk or placement configuration')
+            name, _ = stage2_journal.Journal().create_single(
+                cls.load_resource(), cluster_name, project_id, zone, config,
+                binding)
+            return None, [name]
         # NOTE: The syntax for bulkInsert() is different from insert().
         # bulkInsert expects resource names without prefix. Otherwise
         # it causes a 503 error.
@@ -789,6 +866,8 @@ class GCPComputeInstance(GCPInstance):
     def _insert(cls, names: List[str], project_id: str, zone: str,
                 config: dict) -> List[dict]:
         # Convert name to selflink
+        if stage2_hardening.enabled():
+            raise ValueError('Stage 2 creation must use the immutable journal')
         existing_machine_type = config['machineType']
         if not re.search('.*/machineTypes/.*', existing_machine_type):
             config['machineType'] = (
@@ -838,6 +917,8 @@ class GCPComputeInstance(GCPInstance):
     @classmethod
     def _bulk_insert(cls, names: List[str], project_id: str, zone: str,
                      config: dict) -> List[dict]:
+        if stage2_hardening.enabled():
+            raise ValueError('Stage 2 creation must use the immutable journal')
         source_instance_template = config.pop('sourceInstanceTemplate', None)
         if 'scheduling' in config and isinstance(config['scheduling'], list):
             # For backeward compatibility: converting the list of dictionaries
@@ -967,7 +1048,12 @@ class GCPComputeInstance(GCPInstance):
         return None
 
     @classmethod
+    @stage2_journal.bounded
     def start_instance(cls, node_id: str, project_id: str, zone: str) -> None:
+        if stage2_hardening.enabled():
+            resource, _ = stage2_journal.Journal().require_owned(
+                cls.load_resource(), 'instances', project_id, zone, node_id)
+            node_id = str(resource['id'])
         operation = (cls.load_resource().instances().start(
             project=project_id,
             zone=zone,
@@ -1001,9 +1087,22 @@ class GCPComputeInstance(GCPInstance):
         ]
 
     @classmethod
+    @stage2_journal.bounded
     def resize_disk(cls, project_id: str, availability_zone: str,
                     node_config: dict, instance_name: str) -> None:
         """Resize a Google Cloud disk based on the provided configuration."""
+        if stage2_hardening.enabled():
+            _, receipt = stage2_journal.Journal().require_owned(
+                cls.load_resource(), 'instances', project_id, availability_zone,
+                instance_name)
+            disk = stage2_journal.rpc(cls.load_resource().disks().get(
+                project=project_id,
+                zone=availability_zone,
+                disk=receipt['request']['disk_id']))
+            if str(disk['sizeGb']) != str(
+                    node_config['disks'][0]['initializeParams']['diskSizeGb']):
+                raise ValueError('Stage 2 disk resizing is forbidden')
+            return
 
         # Extract the specified disk size from the configuration
         new_size_gb = node_config['disks'][0]['initializeParams']['diskSizeGb']
@@ -1053,6 +1152,8 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
         total_count: int,
         include_head_node: bool,
     ) -> Tuple[Optional[List], List[str]]:
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         logger.debug(f'Creating cluster with MIG: {cluster_name!r}')
         config = copy.deepcopy(node_config)
         labels = dict(config.get('labels', {}), **labels)
@@ -1195,6 +1296,8 @@ class GCPManagedInstanceGroup(GCPComputeInstance):
     @classmethod
     def delete_mig(cls, project_id: str, zone: str, cluster_name: str) -> bool:
         """Returns whether the MIG is deleted successfully."""
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         mig_exists_and_deleted = True
         mig_name = mig_utils.get_managed_instance_group_name(cluster_name)
         # Get all resize request of the MIG and cancel them.
@@ -1389,6 +1492,8 @@ class GCPTPUVMInstance(GCPInstance):
     @classmethod
     def stop(cls, project_id: str, zone: str, instance: str) -> dict:
         """Stop a TPU VM."""
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         del project_id, zone  # unused
         operation = cls.load_resource().projects().locations().nodes().stop(
             name=instance).execute()
@@ -1397,6 +1502,8 @@ class GCPTPUVMInstance(GCPInstance):
     @classmethod
     def terminate(cls, project_id: str, zone: str, instance: str) -> dict:
         """Terminate a TPU VM."""
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         del project_id, zone  # unused
         operation = cls.load_resource().projects().locations().nodes().delete(
             name=instance).execute()
@@ -1412,6 +1519,8 @@ class GCPTPUVMInstance(GCPInstance):
     ) -> None:
         # https://cloud.google.com/tpu/docs/reference/rest/v2alpha1/projects.locations.nodes  # pylint: disable=line-too-long
         # https://cloud.google.com/tpu/docs/reference/rest/v2alpha1/projects.locations.nodes/patch  # pylint: disable=line-too-long
+        if stage2_hardening.enabled():
+            raise ValueError('Stage 2 creation must use the immutable journal')
         del project_id, zone  # unused
         try:
             response = cls.load_resource().projects().locations().nodes().get(
@@ -1455,6 +1564,8 @@ class GCPTPUVMInstance(GCPInstance):
     @_retry_on_gcp_http_exception('unable to queue the operation')
     def set_labels(cls, project_id: str, availability_zone: str, node_id: str,
                    labels: dict) -> None:
+        if stage2_hardening.enabled():
+            raise ValueError('Stage 2 creation must use the immutable journal')
         while True:
             # wait until the instance become ready before setting labels
             # as Cloud TPU API does not allow setting labels on pending
@@ -1561,6 +1672,8 @@ class GCPTPUVMInstance(GCPInstance):
         total_count: int,
         include_head_node: bool,
     ) -> Tuple[Optional[List], List[str]]:
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         config = copy.deepcopy(node_config)
         # removing Compute-specific default key set in config.py
         config.pop('networkInterfaces', None)
@@ -1605,6 +1718,8 @@ class GCPTPUVMInstance(GCPInstance):
         zone: str,
         config: dict,
     ) -> Tuple[Optional[List], List[str]]:
+        if stage2_hardening.enabled():
+            raise ValueError('Stage 2 creation must use the immutable journal')
         operations = []
         queued_resource_ids = []
 
@@ -1697,6 +1812,8 @@ class GCPTPUVMInstance(GCPInstance):
         zone: str,
         config: dict,
     ) -> Tuple[Optional[List], List[str]]:
+        if stage2_hardening.enabled():
+            raise ValueError('Stage 2 creation must use the immutable journal')
         operations = []
         for i, name in enumerate(names):
             node_config = config.copy()
@@ -1837,6 +1954,8 @@ class GCPTPUVMInstance(GCPInstance):
 
     @classmethod
     def start_instance(cls, node_id: str, project_id: str, zone: str) -> None:
+        if stage2_hardening.enabled():
+            raise ValueError('unsupported Stage 2 mutation')
         operation = (cls.load_resource().projects().locations().nodes().start(
             name=node_id).execute())
 
@@ -2010,6 +2129,8 @@ def delete_tpu_node(project_id: str, zone: str, tpu_node_config: Dict[str,
     is ok to call this function to delete the TPU node when stopping the cluster
     because the host VM will be stopped and have all the information preserved.
     """
+    if stage2_hardening.enabled():
+        raise ValueError('unsupported Stage 2 mutation')
     tpu_name = tpu_node_config['name']
     try:
         cmd = (f'gcloud compute tpus delete {tpu_name} '
