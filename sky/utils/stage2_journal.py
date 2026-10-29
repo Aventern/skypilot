@@ -711,8 +711,8 @@ def guard_compute(compute):
 @bounded
 def cleanup_job(*, job_id=None, cluster=None):
     """API-server retry entry, also used for terminal jobs and missing handles."""
-    from sky.provision.gcp import (
-        instance_utils)  # pylint: disable=import-outside-toplevel
+    # pylint: disable=import-outside-toplevel
+    from sky.provision.gcp import instance_utils
     journal = Journal()
     bindings = [
         binding for binding in read_job_records(
