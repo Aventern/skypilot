@@ -28,11 +28,24 @@ from sky.utils import auth_utils
 from sky.utils import common_utils
 from sky.utils import controller_utils
 from sky.utils import stage2_hardening
+from sky.utils import stage2_journal
 from sky.utils import yaml_utils
 
 sky_check = importlib.import_module('sky.check')
 PROJECT = 'stage2-test-project'
-SAFE = {'stage2_hardening': {'project_id': PROJECT}}
+SAFE = {
+    'stage2_hardening': dict(
+        project_id=PROJECT,
+        allowed_project_ids=[PROJECT],
+        control_bucket='stage2-control',
+        evidence_bucket='stage2-evidence',
+        pool='main',
+        guest_service_account=f'stage2-guest@{PROJECT}.iam.gserviceaccount.com'
+    ),
+    'gcp': {
+        'service_account': f'stage2-guest@{PROJECT}.iam.gserviceaccount.com'
+    }
+}
 
 
 class BoundaryReached(BaseException):
@@ -109,6 +122,9 @@ async def scheduled(*_):
 
 def managed_launch(monkeypatch, recovery, operation):
     # Keep the real StrategyExecutor._launch and Failover.recover dispatch.
+    monkeypatch.setattr(
+        stage2_journal, 'Journal',
+        lambda: SimpleNamespace(bind_job=lambda *_: {'validated': True}))
     executor = recovery_strategy.FailoverStrategyExecutor.__new__(
         recovery_strategy.FailoverStrategyExecutor)
     executor.__dict__.update(job_id=1,
@@ -119,7 +135,7 @@ def managed_launch(monkeypatch, recovery, operation):
                              pool=None,
                              cluster_name='stage2-worker',
                              file_mounts_blob_id=None,
-                             dag=SimpleNamespace(tasks=[]),
+                             dag=SimpleNamespace(tasks=[SimpleNamespace()]),
                              _launched_resources=None)
     executor._refresh_priority_from_persisted_dag = mock.AsyncMock()
     executor._try_cancel_jobs = mock.AsyncMock()
@@ -223,12 +239,37 @@ def gcp_boundary(monkeypatch):
 
 
 def auth_config(project=PROJECT):
-    return {'provider': {'project_id': project}, 'auth': {'ssh_user': 'fake'}}
+    return {
+        'provider': {
+            'project_id': project
+        },
+        'auth': {
+            'ssh_user': 'fake'
+        },
+        'available_node_types': {
+            'head': {
+                'node_config': {
+                    'metadata': {
+                        'items': [{
+                            'key': 'enable-oslogin',
+                            'value': 'FALSE'
+                        }]
+                    }
+                }
+            }
+        }
+    }
 
 
 def bootstrap(project=PROJECT):
     config = common.ProvisionConfig(
-        provider_config={'project_id': project},
+        provider_config={
+            'project_id': project,
+            'vpc_name': 'fixed',
+            'stage2_ownership': {
+                'test': True
+            }
+        },
         authentication_config={},
         docker_config={},
         node_config={'machineType': 'n1-standard-4'},
@@ -261,8 +302,13 @@ def test_oslogin_changed_after_preflight_never_creates_firewall(
     compute.projects.return_value.get.return_value.execute.return_value = metadata
 
     def authenticate():
-        with pytest.raises(exceptions.InvalidCloudConfigs, match='OS Login'):
-            authentication.setup_gcp_authentication(auth_config())
+        authentication.setup_gcp_authentication(auth_config())
+        unsafe = auth_config()
+        unsafe['available_node_types']['head']['node_config']['metadata'][
+            'items'][0]['value'] = 'TRUE'
+        with pytest.raises(exceptions.InvalidCloudConfigs,
+                           match='enable-oslogin'):
+            authentication.setup_gcp_authentication(unsafe)
         raise BoundaryReached
 
     with pytest.raises(BoundaryReached):

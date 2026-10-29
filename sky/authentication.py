@@ -154,6 +154,18 @@ def setup_gcp_authentication(config: Dict[str, Any]) -> Dict[str, Any]:
         raise
 
     project_oslogin = parse_gcp_project_oslogin(project)
+    if stage2_hardening.enabled():
+        for node in config['available_node_types'].values():
+            items = node['node_config'].get('metadata', {}).get('items', [])
+            if [
+                    item.get('value')
+                    for item in items
+                    if item.get('key') == 'enable-oslogin'
+            ] != ['FALSE']:
+                raise exceptions.InvalidCloudConfigs(
+                    'Stage 2 VM enable-oslogin must be explicitly FALSE.')
+        project_oslogin = 'false'
+
     if project_oslogin.lower() == 'true':
         if stage2_hardening.enabled():
             raise exceptions.InvalidCloudConfigs(

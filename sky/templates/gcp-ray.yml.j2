@@ -198,6 +198,10 @@ available_node_types:
   {%- endif %}
       metadata:
         items:
+  {%- if stage2_instance_oslogin | default(false) %}
+          - key: enable-oslogin
+            value: "FALSE"
+  {%- endif %}
           - key: ssh-keys
             # After replacing the variables, this will become username:ssh_public_key_content.
             # This is a specific syntax required by GCP https://cloud.google.com/compute/docs/connect/add-ssh-keys

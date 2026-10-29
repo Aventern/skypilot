@@ -129,3 +129,38 @@ def classify(resource, records, *, project_id):
                                  records + [disk_record],
                                  project_id=project_id,
                                  resources=[resource, disk])
+
+
+def test_vm_requires_observed_original_disk():
+    vm, record = fixture()
+    disk, disk_record = fixture('disks')
+    disk['id'] = disk_record['operation']['targetId'] = '456'
+    records = [record, disk_record]
+    assert own.classify_resource(vm, records, project_id=PROJECT) == own.SUSPECT
+    assert own.classify_resource(vm,
+                                 records,
+                                 project_id=PROJECT,
+                                 resources=[vm, disk]) == own.OWNED
+    disk['id'] = '789'
+    assert own.classify_resource(vm,
+                                 records,
+                                 project_id=PROJECT,
+                                 resources=[vm, disk]) == own.SUSPECT
+
+
+def test_job_requires_immutable_numeric_binding():
+    _, record = fixture()
+    binding = {
+        k: record['request'][k]
+        for k in ('project_id', 'job_id', 'job_name', 'cluster', 'labels',
+                  'guest_service_account', 'intent')
+    }
+    view = {'job_name': binding['job_name'], 'job_id': 42}
+    assert own.classify_job(view, [binding], project_id=PROJECT) == own.OWNED
+    for key in binding:
+        broken = copy.deepcopy(binding)
+        broken.pop(key)
+        assert own.classify_job(view, [broken],
+                                project_id=PROJECT) == own.SUSPECT
+    assert own.classify_job(dict(view, job_id=43), [binding],
+                            project_id=PROJECT) == own.SUSPECT
