@@ -1768,6 +1768,13 @@ def cancel_jobs_by_id(job_ids: Optional[List[int]],
         # terminal state, we can safely skip it.
         job_status = managed_job_state.get_status(job_id)
         if job_status is None:
+            if (stage2_hardening.enabled() and
+                    managed_job_state.get_workspace(job_id)
+                    == current_workspace):
+                # A durable Stage 2 binding can precede the spot/PENDING row.
+                # cleanup_job only selects that exact recorded ID and fences
+                # all future creates before closing its recovery index.
+                stage2_journal.cleanup_job(job_id=job_id)
             logger.info(f'Job {job_id} not found. Skipped.')
             continue
 

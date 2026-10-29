@@ -365,6 +365,7 @@ def test_managed_binding_reads_exact_intent_and_rejects_changed_spec(
     # Use a distinct binding name, because the fixture registered another intent.
     storage.objects.pop(j.prefix + 'jobs/' + spec['name'] + '.json')
     storage.objects.pop(j.prefix + 'jobs-by-id/42.json')
+    storage.objects.pop(j.prefix + 'jobs-active.json')
     binding = j.bind_job(task, 42, 'pull-main-cluster')
     assert own.classify_job({
         'job_name': task.name,
@@ -592,3 +593,83 @@ def test_rpc_timeout_is_clamped_to_remaining_scope(environment, monkeypatch):
             journal.rpc(request)
     finally:
         journal._SCOPE.reset(token)
+
+
+@pytest.mark.parametrize('kind', ['instances', 'disks'])
+def test_pending_insert_failure_retires_after_verified_absence(
+        environment, monkeypatch, kind):
+    storage, compute, j, _, _ = environment
+    original = Collection.perform
+
+    def pending(collection, action, args):
+        result = original(collection, action, args)
+        if collection.kind == kind and action == 'insert':
+            result['status'] = 'PENDING'
+            compute.operations[result['name']]['status'] = 'PENDING'
+        return result
+
+    monkeypatch.setattr(Collection, 'perform', pending)
+    monkeypatch.setattr(journal.time, 'sleep', lambda _: None)
+    if kind == 'disks':
+        with pytest.raises(RuntimeError, match='pending'):
+            create(environment)
+        name = next(iter(compute.resources['disks']))
+    else:
+        name = create(environment)
+    request = j.request(kind, ZONE, name)
+    operation = next(op for op in compute.operations.values()
+                     if op['clientOperationId'] == request['request_id'])
+    # The persisted receipt predates this asynchronous terminal response.
+    operation.update(
+        status='DONE',
+        error={'errors': [{
+            'code': 'ZONE_RESOURCE_POOL_EXHAUSTED'
+        }]})
+    compute.resources['instances'].clear()
+    for disk in compute.resources['disks'].values():
+        disk['users'] = []
+    compute.resources[kind].clear()
+    for attempt in range(6):
+        try:
+            journal.cleanup_job(job_id=42)
+            break
+        except RuntimeError:
+            if attempt == 5:
+                raise
+    assert journal.read_records(storage, CONFIG['control_bucket'],
+                                CONFIG['pool']) == []
+    assert all(not values for values in compute.resources.values())
+    failed = journal._read(j.blob(f'failed/{kind}/{ZONE}/{name}.json'))
+    assert failed['operation'] == operation
+    # A repeated cancel must remain terminal.
+    journal.cleanup_job(job_id=42)
+
+
+@pytest.mark.parametrize(
+    'field',
+    ['name', 'clientOperationId', 'targetId', 'targetLink', 'operationType'])
+def test_failed_operation_cannot_replace_recorded_identity(environment, field):
+    _, compute, j, _, _ = environment
+    name = create(environment)
+    request = j.request('instances', ZONE, name)
+    operation = next(op for op in compute.operations.values()
+                     if op['clientOperationId'] == request['request_id'])
+    operation.update(status='DONE', error={'errors': [{'code': 'FAILED'}]})
+    operation[field] = 'foreign'
+    with pytest.raises(ValueError, match='identity'):
+        j.recover(compute, 'instances', ZONE, name)
+
+
+@pytest.mark.parametrize('failed', [False, True])
+def test_terminal_operation_proof_survives_api_expiry(environment, failed):
+    storage, compute, j, _, _ = environment
+    name = create(environment)
+    if failed:
+        request = j.request('instances', ZONE, name)
+        operation = next(op for op in compute.operations.values()
+                         if op['clientOperationId'] == request['request_id'])
+        operation.update(status='DONE', error={'errors': [{'code': 'FAILED'}]})
+    expected = j.recover(compute, 'instances', ZONE, name)
+    compute.operations.clear()
+    restarted = journal.Journal(storage)
+    assert restarted.recover(compute, 'instances', ZONE, name) == expected

@@ -889,6 +889,9 @@ class GCP(clouds.Cloud):
     def _check_compute_credentials(
             cls) -> Tuple[bool, Optional[Union[str, Dict[str, str]]]]:
         """Checks if the user has access credentials to this cloud's compute service."""
+        if stage2_hardening.enabled():
+            from sky.utils import stage2_credentials
+            return stage2_credentials.check_credentials(cls)
         return cls._check_credentials(
             [
                 ('compute', 'Compute Engine'),

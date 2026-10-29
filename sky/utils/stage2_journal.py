@@ -126,6 +126,11 @@ def read_job_records(storage, bucket, pool, names=None):
             value = _read(
                 storage.bucket(bucket).blob(
                     f"stage2/{pool}/ownership/jobs/{name}.json"))
+            if value is None:
+                active = _read(
+                    storage.bucket(bucket).blob(
+                        f'stage2/{pool}/ownership/jobs-active.json'))
+                value = (active or {}).get('records', {}).get(name)
             if value is not None:
                 result.append(value)
         return result
@@ -230,9 +235,11 @@ class Journal:
                      labels=spec['resources']['labels'],
                      guest_service_account=self.config['guest_service_account'],
                      project_id=self.config['project_id'])
+        # Publish the recovery index first. A crash at any later boundary is
+        # observable even if neither immutable lookup nor PENDING exists yet.
+        self.active_job_update(value)
         _put(self.blob(f'jobs/{task.name}.json'), value)
         _put(self.blob(f'jobs-by-id/{job_id}.json'), value)
-        self.active_job_update(value)
         return value
 
     def job(self, name):
@@ -281,6 +288,41 @@ class Journal:
             if key not in self._repaired:
                 self.active_update(receipt['request'], receipt)
                 self._repaired.add(key)
+            if key in self._completed:
+                return receipt
+            # A receipt proves identity, not asynchronous success. Preserve a
+            # verified terminal error separately so operation expiry cannot
+            # turn a known failure back into an ambiguous create.
+            failed_blob = self.blob(f'failed/{kind}/{zone}/{name}.json')
+            failed = _read(failed_blob)
+            if failed is not None:
+                return failed
+            completed_blob = self.blob(f'completed/{kind}/{zone}/{name}.json')
+            operation = _read(completed_blob)
+            missing = operation is None
+            if missing:
+                operation = rpc(compute.zoneOperations().get(
+                    project=receipt['request']['project_id'],
+                    zone=zone,
+                    operation=receipt['operation']['name']))
+            if any(
+                    operation.get(k) != receipt['operation'][k]
+                    for k in ('name', 'clientOperationId', 'targetId',
+                              'targetLink', 'operationType')):
+                raise ValueError('create operation identity differs')
+            if operation.get('status') == 'DONE' and operation.get('error'):
+                failed = dict(request=receipt['request'], operation=operation)
+                _put(failed_blob, failed)
+                return failed
+            if operation.get('status') == 'DONE' and not operation.get('error'):
+                if missing:
+                    _put(
+                        completed_blob, {
+                            k: operation[k]
+                            for k in ('name', 'clientOperationId', 'targetId',
+                                      'targetLink', 'operationType', 'status')
+                        })
+                self._completed.add(key)
             return receipt
         request = self.request(kind, zone, name)
         if request is None:
@@ -419,6 +461,12 @@ class Journal:
             if remove:
                 current['records'].pop(name, None)
             else:
+                previous = current['records'].get(name)
+                if previous is not None and previous != value:
+                    raise ValueError('ownership journal conflict')
+                gate = _read(self.blob(f'gates/{name}.json'))
+                if gate and gate['cancelled']:
+                    raise ValueError('cancelled job cannot be republished')
                 if name not in current['records'] and len(
                         current['records']) >= 128:
                     raise ValueError('active job binding bound exceeded')
@@ -773,6 +821,9 @@ def cleanup_job(*, job_id=None, cluster=None):
         if archived is not None and archived['job_id'] == job_id:
             bindings = [archived]
     for binding in bindings:
+        # Repair both immutable lookups before retiring the recovery index.
+        _put(journal.blob(f"jobs/{binding['job_name']}.json"), binding)
+        _put(journal.blob(f"jobs-by-id/{binding['job_id']}.json"), binding)
         journal.gate(binding['job_name'],
                      closing=True,
                      cancelled=job_id is not None)
@@ -835,7 +886,7 @@ def cleanup_job(*, job_id=None, cluster=None):
 
     blob = journal.blob('jobs-active.json')
     current = _read(blob)
-    if current is not None:
+    if current is not None and job_id is not None:
         changed = False
         for name, binding in list(current['records'].items()):
             if ((job_id is not None and binding['job_id'] == job_id) or
