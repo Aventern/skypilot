@@ -121,7 +121,7 @@ def read_job_records(storage, bucket, pool, names=None):
         result = []
         for name in set(names):
             if not isinstance(name, str) or not name.startswith(
-                    ownership.PREFIXES) or "/" in name:
+                    ownership.WORKER_PREFIXES) or "/" in name:
                 continue
             value = _read(
                 storage.bucket(bucket).blob(
@@ -217,7 +217,10 @@ class Journal:
                 task.num_nodes != 1 or spec['num_nodes'] != 1 or
                 task.run != spec['run'] or task.setup != spec['setup'] or
                 type(job_id) is not int or job_id <= 0 or
-                not cluster.startswith(ownership.PREFIXES) or
+                not task.name.startswith(
+                    ownership.worker_prefix(self.config['pool'])) or
+                not cluster.startswith(
+                    ownership.worker_prefix(self.config['pool'])) or
                 expected['STAGE2_EXPECTED_PROJECT'] != self.config['project_id']
                 or expected['STAGE2_EXPECTED_GUEST_SA'] !=
                 self.config['guest_service_account'] or
@@ -548,8 +551,11 @@ class Journal:
         if self.job(binding['job_name']) != binding:
             raise ValueError(
                 'provider binding differs from managed job evidence')
-        if not cluster.startswith(ownership.PREFIXES):
+        prefix = ownership.worker_prefix(self.config['pool'])
+        if not cluster.startswith(prefix):
             raise ValueError('Stage 2 cloud name prefix differs')
+        if not ownership.worker_metadata_valid(config.get('metadata')):
+            raise ValueError('Stage 2 instance SSH metadata differs')
         slot = self.blob(f'attempts/{cluster}/{zone}.json')
         attempt = _read(slot)
         generation = int(slot.generation) if attempt is not None else 0
@@ -592,6 +598,8 @@ class Journal:
                 created_at_epoch=time.time())
             _put(slot, attempt, generation)
         name = attempt['name']
+        if not name.startswith(prefix):
+            raise ValueError('Stage 2 instance name prefix differs')
         vm_body = copy.deepcopy(config)
         boot = vm_body['disks'][0]
         initial = boot['initializeParams']

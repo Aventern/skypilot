@@ -185,9 +185,9 @@ def environment(monkeypatch):
     monkeypatch.setattr(instance_utils.GCPComputeInstance, 'load_resource',
                         lambda: compute)
     j = journal.Journal(storage)
-    binding = dict(job_name='pull-main-w001-i0001',
+    binding = dict(job_name='pull-main-upscale-v1-w001-i0001',
                    job_id=42,
-                   cluster='pull-main-cluster',
+                   cluster='pull-main-upscale-v1-cluster',
                    labels=LABELS,
                    guest_service_account=CONFIG['guest_service_account'],
                    project_id=PROJECT,
@@ -211,10 +211,15 @@ def environment(monkeypatch):
         serviceAccounts=[{
             'email': CONFIG['guest_service_account']
         }],
-        metadata={'items': [{
-            'key': 'enable-oslogin',
-            'value': 'FALSE'
-        }]},
+        metadata={
+            'items': [{
+                'key': 'enable-oslogin',
+                'value': 'FALSE'
+            }, {
+                'key': 'block-project-ssh-keys',
+                'value': 'TRUE'
+            }]
+        },
         _stage2_ownership=binding)
     return storage, compute, j, binding, config
 
@@ -337,7 +342,7 @@ def test_managed_binding_reads_exact_intent_and_rejects_changed_spec(
 
     from sky import Task
     storage, _, j, _, _ = environment
-    spec = dict(name='pull-main-w001-i0001',
+    spec = dict(name='pull-main-upscale-v1-w001-i0001',
                 num_nodes=1,
                 setup='echo setup',
                 run='echo run',
@@ -366,7 +371,7 @@ def test_managed_binding_reads_exact_intent_and_rejects_changed_spec(
     storage.objects.pop(j.prefix + 'jobs/' + spec['name'] + '.json')
     storage.objects.pop(j.prefix + 'jobs-by-id/42.json')
     storage.objects.pop(j.prefix + 'jobs-active.json')
-    binding = j.bind_job(task, 42, 'pull-main-cluster')
+    binding = j.bind_job(task, 42, 'pull-main-upscale-v1-cluster')
     assert own.classify_job({
         'job_name': task.name,
         'job_id': 42
@@ -374,12 +379,12 @@ def test_managed_binding_reads_exact_intent_and_rejects_changed_spec(
                             project_id=PROJECT) == own.OWNED
     task.run = 'echo changed'
     with pytest.raises(ValueError):
-        j.bind_job(task, 42, 'pull-main-cluster')
+        j.bind_job(task, 42, 'pull-main-upscale-v1-cluster')
     task.run = spec['run']
     task.set_resources(
         {next(iter(task.resources)).copy(instance_type='g2-standard-8')})
     with pytest.raises(ValueError):
-        j.bind_job(task, 42, 'pull-main-cluster')
+        j.bind_job(task, 42, 'pull-main-upscale-v1-cluster')
 
 
 def test_receipt_index_crash_repairs_without_reinserting(environment):
@@ -458,7 +463,7 @@ def test_pending_binding_precedes_visibility(environment, monkeypatch):
     from sky import Task
     from sky.jobs import state
     from sky.jobs.server import core
-    task = Task(name='pull-main-w001-i0001')
+    task = Task(name='pull-main-upscale-v1-w001-i0001')
     with Dag() as dag:
         task
     dag.add(task)
@@ -487,7 +492,7 @@ def test_quota_narrowed_order_uses_same_immutable_intent(environment):
 
     from sky import Task
     storage, _, j, _, _ = environment
-    spec = dict(name='pull-narrow-w001-i0001',
+    spec = dict(name='pull-main-upscale-v1-w001-i0002',
                 num_nodes=1,
                 setup='true',
                 run='true',
@@ -520,10 +525,10 @@ def test_quota_narrowed_order_uses_same_immutable_intent(environment):
             dict(uri=f'gs://stage2-evidence/{key}', sha256=digest,
                  generation=1))
     })
-    assert j.bind_job(task, 43, 'pull-narrow-cluster')['job_id'] == 43
+    assert j.bind_job(task, 43, 'pull-main-upscale-v1-narrow')['job_id'] == 43
     task.update_envs({'STAGE2_REGION_ORDER': 'asia-east1'})
     with pytest.raises(ValueError, match='region subset'):
-        j.bind_job(task, 43, 'pull-narrow-cluster')
+        j.bind_job(task, 43, 'pull-main-upscale-v1-narrow')
 
 
 def test_recovery_after_partial_cleanup_allocates_fresh_name(environment):
@@ -673,3 +678,48 @@ def test_terminal_operation_proof_survives_api_expiry(environment, failed):
     compute.operations.clear()
     restarted = journal.Journal(storage)
     assert restarted.recover(compute, 'instances', ZONE, name) == expected
+
+
+@pytest.mark.parametrize('cluster', ['stage2-apiserver', 'pull-other-cluster'])
+def test_create_rejects_names_outside_pool_before_compute(environment, cluster):
+    storage, compute, j, binding, config = environment
+    before = copy.deepcopy(storage.objects)
+    with pytest.raises(ValueError, match='cloud name prefix'):
+        j.create_single(compute, cluster, PROJECT, ZONE, config, binding)
+    assert compute.calls == []
+    assert storage.objects == before
+
+
+@pytest.mark.parametrize('values', [[], ['FALSE'], ['true'], ['TRUE', 'TRUE']])
+def test_create_rejects_project_ssh_keys_before_disk_insert(
+        environment, values):
+    storage, compute, _, _, config = environment
+    items = [
+        m for m in config['metadata']['items']
+        if m['key'] != 'block-project-ssh-keys'
+    ]
+    items.extend({
+        'key': 'block-project-ssh-keys',
+        'value': value
+    } for value in values)
+    config['metadata']['items'] = items
+    before = copy.deepcopy(storage.objects)
+    with pytest.raises(ValueError, match='SSH metadata'):
+        create(environment)
+    assert compute.calls == []
+    assert storage.objects == before
+
+
+def test_modified_ssh_metadata_blocks_numeric_mutation(environment):
+    _, compute, _, _, _ = environment
+    name = create(environment)
+    vm = compute.resources['instances'][name]
+    vm['metadata']['items'] = [
+        m for m in vm['metadata']['items']
+        if m['key'] != 'block-project-ssh-keys'
+    ]
+    before = len(compute.calls)
+    with pytest.raises(ValueError):
+        instance_utils.GCPComputeInstance.terminate(PROJECT, ZONE, name)
+    assert not any(
+        action == 'delete' for _, action, _ in compute.calls[before:])

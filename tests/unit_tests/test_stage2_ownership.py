@@ -2,6 +2,10 @@
 import copy
 import itertools
 
+import pytest
+
+from sky.jobs import utils as job_utils
+from sky.utils import common_utils
 from sky.utils import stage2_ownership as own
 
 PROJECT = 'dayseum-training'
@@ -26,7 +30,7 @@ def fixture(kind='instances'):
         request_id='r',
         job_name='pull-main-w001-i0001',
         job_id=42,
-        cluster='pull-main-cluster',
+        cluster='pull-main-upscale-v1-cluster',
         labels=LABELS,
         guest_service_account=f'stage2-guest@{PROJECT}.iam.gserviceaccount.com',
         intent=dict(uri='gs://evidence/intent', sha256='a' * 64, generation=1),
@@ -43,16 +47,21 @@ def fixture(kind='instances'):
               zone=ROOT,
               labels=dict(
                   LABELS, **{
-                      'ray-cluster-name': 'pull-main-cluster',
-                      'skypilot-cluster-name': 'pull-main-cluster'
+                      'ray-cluster-name': 'pull-main-upscale-v1-cluster',
+                      'skypilot-cluster-name': 'pull-main-upscale-v1-cluster'
                   }),
               serviceAccounts=[{
                   'email': request['guest_service_account']
               }],
-              metadata={'items': [{
-                  'key': 'enable-oslogin',
-                  'value': 'FALSE'
-              }]},
+              metadata={
+                  'items': [{
+                      'key': 'enable-oslogin',
+                      'value': 'FALSE'
+                  }, {
+                      'key': 'block-project-ssh-keys',
+                      'value': 'TRUE'
+                  }]
+              },
               disks=[{
                   'boot': True,
                   'source': f'{ROOT}/disks/{NAME}'
@@ -113,7 +122,6 @@ def test_disk_id_survives_detach_but_not_recreation():
 
 
 def test_project_allowlist_exact_match():
-    import pytest
     own.require_allowed_project(PROJECT, [PROJECT])
     for values in ([], [PROJECT,
                         PROJECT], ['prefix-' + PROJECT], ['bad'], None):
@@ -164,3 +172,73 @@ def test_job_requires_immutable_numeric_binding():
                                 project_id=PROJECT) == own.SUSPECT
     assert own.classify_job(dict(view, job_id=43), [binding],
                             project_id=PROJECT) == own.SUSPECT
+
+
+def test_control_plane_namespace_is_never_worker_owned():
+    for kind in ('instances', 'disks'):
+        for name in ('stage2-apiserver', 'stage2-apiserver-boot',
+                     'stage2-owned'):
+            resource, record = fixture(kind)
+            resource.update(name=name, selfLink=f'{ROOT}/{kind}/{name}')
+            record['request'].update(name=name, cluster=name, job_name=name)
+            record['operation']['targetLink'] = resource['selfLink']
+            for labels in ({}, {
+                    'pool': 'main-upscale-v1',
+                    'component': 'pull-inference'
+            }):
+                resource['labels'] = labels
+                assert own.classify_resource(
+                    resource, [record], project_id=PROJECT) == own.UNRELATED
+            for mask in itertools.product((False, True), repeat=len(LABELS)):
+                resource['labels'] = {
+                    key: LABELS[key]
+                    for key, include in zip(LABELS, mask)
+                    if include
+                }
+                expected = own.SUSPECT if any(mask) else own.UNRELATED
+                assert own.classify_resource(resource, [record],
+                                             project_id=PROJECT) == expected
+            binding = dict(record['request'])
+            assert own.classify_job({
+                'job_name': name,
+                'job_id': 42
+            }, [binding],
+                                    project_id=PROJECT) == own.UNRELATED
+    for kind in ('instances', 'disks'):
+        assert own.candidate_filters(kind)[0] == 'name eq "pull-.*"'
+
+
+def test_worker_requires_exact_ssh_metadata_before_ownership():
+    vm, record = fixture()
+    assert classify(vm, [record], project_id=PROJECT) == own.OWNED
+    for key, expected in (('enable-oslogin', 'FALSE'),
+                          ('block-project-ssh-keys', 'TRUE')):
+        for values in ([], [None], [True], ['true'],
+                       ['FALSE' if expected == 'TRUE' else 'TRUE'
+                       ], [expected, expected]):
+            changed = copy.deepcopy(vm)
+            items = [m for m in changed['metadata']['items'] if m['key'] != key]
+            items.extend({'key': key, 'value': value} for value in values)
+            changed['metadata']['items'] = items
+            assert classify(changed, [record],
+                            project_id=PROJECT) == own.SUSPECT
+
+
+def test_worker_pool_prefix_survives_actual_skypilot_name_generation(
+        monkeypatch):
+    monkeypatch.setattr(common_utils, 'get_user_hash', lambda: 'fb16a555')
+    for pool in ('a', 'main-upscale-v1', 'a' * 17, 'a-b-c-d-e-f-g-h-i'):
+        prefix = own.worker_prefix(pool)
+        assert len(prefix) <= 23
+        for slot, incarnation, job_id in itertools.product((1, 64), (1, 9999),
+                                                           (1, 1000000)):
+            task_name = f'{prefix}w{slot:03d}-i{incarnation:04d}'
+            cluster = job_utils.generate_managed_job_cluster_name(
+                task_name, job_id)
+            cloud_name = common_utils.make_cluster_name_on_cloud(cluster, 35)
+            instance = f'{cloud_name[:23]}-head-0123456789abcdef-compute'
+            assert cloud_name.startswith(prefix)
+            assert instance.startswith(prefix)
+    for pool in ('a' * 18, 'main_upscale', '-main', 'main-', '', None):
+        with pytest.raises(ValueError):
+            own.worker_prefix(pool)

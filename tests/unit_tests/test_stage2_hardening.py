@@ -13,7 +13,10 @@ import shutil
 from types import SimpleNamespace
 from unittest import mock
 
+import jinja2
+from jinja2 import meta
 import pytest
+import yaml
 
 from sky import authentication
 from sky import clouds
@@ -421,3 +424,29 @@ def test_disabled_backend_keeps_existing_mount_behavior(config_file,
     with pytest.raises(BoundaryReached):
         write_config()
     keys.assert_called_once()
+
+
+def test_rendered_worker_template_blocks_project_ssh_keys():
+    template = (Path(__file__).parents[2] / 'sky/templates/gcp-ray.yml.j2')
+    environment = jinja2.Environment()
+    source = template.read_text()
+    values = dict.fromkeys(
+        meta.find_undeclared_variables(environment.parse(source)))
+    values.update(volumes=[],
+                  num_nodes=1,
+                  labels={},
+                  credentials={},
+                  initial_setup_commands=[],
+                  gcp_use_managed_instance_group_value='false')
+    for enabled in (False, True):
+        values['stage2_instance_oslogin'] = enabled
+        rendered = yaml.safe_load(
+            environment.from_string(source).render(**values))
+        items = rendered['available_node_types']['ray_head_default'][
+            'node_config']['metadata']['items']
+        oslogin = [m['value'] for m in items if m['key'] == 'enable-oslogin']
+        block = [
+            m['value'] for m in items if m['key'] == 'block-project-ssh-keys'
+        ]
+        assert oslogin == (['FALSE'] if enabled else [])
+        assert block == (['TRUE'] if enabled else [])

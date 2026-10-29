@@ -201,6 +201,8 @@ available_node_types:
   {%- if stage2_instance_oslogin | default(false) %}
           - key: enable-oslogin
             value: "FALSE"
+          - key: block-project-ssh-keys
+            value: "TRUE"
   {%- endif %}
           - key: ssh-keys
             # After replacing the variables, this will become username:ssh_public_key_content.

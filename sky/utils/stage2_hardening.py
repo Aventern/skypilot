@@ -24,10 +24,10 @@ def settings():
             raise ValueError('Stage 2 hardening configuration is incomplete')
         stage2_ownership.require_allowed_project(config['project_id'],
                                                  config['allowed_project_ids'])
-        if (re.fullmatch(r'[a-z0-9][a-z0-9_-]{0,17}', config['pool']) is None or
-                any(
-                    re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', config[k])
-                    is None for k in ('control_bucket', 'evidence_bucket')) or
+        stage2_ownership.worker_prefix(config['pool'])
+        if (any(
+                re.fullmatch(r'[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]', config[k]) is
+                None for k in ('control_bucket', 'evidence_bucket')) or
                 not config['guest_service_account'].endswith(
                     '@' + config['project_id'] + '.iam.gserviceaccount.com')):
             raise ValueError('Stage 2 hardening identity is malformed')
